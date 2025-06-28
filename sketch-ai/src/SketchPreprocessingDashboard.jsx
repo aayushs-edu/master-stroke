@@ -69,9 +69,14 @@ const SketchPreprocessingDashboard = () => {
     cannyLow: 50,
     cannyHigh: 150,
     
-    // Step 6: Ridge Filter
+    // Step 6: Ridge Filter (Enhanced Controls)
     useRidgeFilter: false,
-    ridgeThreshold: 0.05,
+    ridgeThreshold: 0.01,        // Lower default (was 0.05)
+    ridgeIntensity: 0.3,         // NEW: Control blend intensity (0-1)
+    ridgeBlendMode: 'soft',      // NEW: 'soft', 'hard', 'overlay'
+    ridgePreBlur: 1.0,          // NEW: Pre-blur for smoother results
+    ridgePostProcess: true,      // NEW: Apply morphological smoothing after
+    
     
     // Step 7: Morphological Cleanup
     cleanupClosing: 3,
@@ -240,6 +245,16 @@ const SketchPreprocessingDashboard = () => {
     },
 
     // Thresholding
+    sauvolaThreshold: {
+      name: 'Sauvola Thresholding',
+      description: 'Adaptive binarization using Sauvola’s method for local thresholding.',
+      category: 'Thresholding',
+      allowMultiple: true,
+      params: {
+        windowSize: { min: 15, max: 75, default: 63, step: 2, label: 'Window Size', previewValues: [15, 31, 51, 63, 75] },
+        k: { min: 0.1, max: 0.5, default: 0.2, step: 0.01, label: 'K Value', previewValues: [0.1, 0.2, 0.3, 0.4, 0.5] }
+      }
+    },
     adaptiveThreshold: {
       name: 'Adaptive Threshold',
       description: 'Local thresholding for varying illumination',
@@ -713,6 +728,8 @@ const SketchPreprocessingDashboard = () => {
         return applyLaplacianEdgeDetection(imageData, params);
       case 'morphology':
         return applyMorphology(imageData, params);
+      case 'sauvolaThreshold':
+        return applySauvolaThreshold(imageData, params);
       case 'adaptiveThreshold':
         return applyAdaptiveThreshold(imageData, params);
       case 'otsuThreshold':
@@ -1753,17 +1770,60 @@ const SketchPreprocessingDashboard = () => {
     return new ImageData(newData, width, height);
   };
 
-  // Step 6: Frangi Vesselness (Ridge Filter)
-  const applyFrangiVesselness = (imageData, threshold) => {
-    // Simplified Frangi vesselness - use enhanced edge detection
-    const enhanced = applySobelEdgeDetection(imageData, { 
+  
+  const applyFrangiVesselness = (imageData, params) => {
+    const { threshold, intensity, blendMode, preBlur, postProcess } = params;
+    
+    // Apply pre-blur for smoother ridge detection
+    let processedImage = imageData;
+    if (preBlur > 0) {
+      processedImage = applyGaussianBlur(imageData, { 
+        kernelSize: Math.max(3, Math.ceil(preBlur * 2) | 1), 
+        sigma: preBlur 
+      });
+    }
+    
+    // Enhanced edge detection with multiple scales
+    const edges1 = applySobelEdgeDetection(processedImage, { 
+      lowThreshold: threshold * 50, 
+      highThreshold: threshold * 100 
+    });
+    
+    const edges2 = applySobelEdgeDetection(processedImage, { 
       lowThreshold: threshold * 100, 
       highThreshold: threshold * 200 
     });
     
-    // Apply additional morphological filtering to enhance vessel-like structures
-    return applyMorphology(enhanced, { operation: 'opening', kernelSize: 3, iterations: 1 });
+    // Combine multiple scales with weighted average
+    const width = imageData.width;
+    const height = imageData.height;
+    const data1 = edges1.data;
+    const data2 = edges2.data;
+    const newData = new Uint8ClampedArray(data1.length);
+    
+    for (let i = 0; i < data1.length; i += 4) {
+      // Weighted combination of different scales
+      const combined = (data1[i] * 0.7 + data2[i] * 0.3);
+      newData[i] = combined;
+      newData[i + 1] = combined;
+      newData[i + 2] = combined;
+      newData[i + 3] = 255;
+    }
+    
+    let ridgeResult = new ImageData(newData, width, height);
+    
+    // Apply post-processing morphological smoothing
+    if (postProcess) {
+      ridgeResult = applyMorphology(ridgeResult, { 
+        operation: 'opening', 
+        kernelSize: 3, 
+        iterations: 1 
+      });
+    }
+    
+    return ridgeResult;
   };
+
 
   // Step 8: Zhang-Suen Skeletonization
   const applyZhangSuenSkeleton = (imageData, maxIterations) => {
@@ -2000,9 +2060,17 @@ const SketchPreprocessingDashboard = () => {
       // Step 6: Ridge Filter (optional)
       if (stepToggles.step6_ridge && params.useRidgeFilter) {
         stepNumber++;
-        const ridgeFiltered = applyFrangiVesselness(currentImage, params.ridgeThreshold);
-        currentImage = combineImages(currentImage, ridgeFiltered, 'or');
-        steps.push({ name: `${stepNumber}. Ridge Filter`, dataUrl: null, imageData: currentImage, enabled: true });
+        const ridgeFiltered = applyFrangiVesselness(currentImage, {
+          threshold: params.ridgeThreshold,
+          intensity: params.ridgeIntensity,
+          blendMode: params.ridgeBlendMode,
+          preBlur: params.ridgePreBlur,
+          postProcess: params.ridgePostProcess
+        });
+        
+        // Apply controlled blending based on intensity and blend mode
+        currentImage = combineImagesWithIntensity(currentImage, ridgeFiltered, params.ridgeBlendMode, params.ridgeIntensity);
+        steps.push({ name: `${stepNumber}. Ridge Filter (${params.ridgeIntensity * 100}% intensity)`, dataUrl: null, imageData: currentImage, enabled: true });
       } else {
         const skipReason = !stepToggles.step6_ridge ? '(SKIPPED)' : '(DISABLED)';
         steps.push({ name: `6. Ridge Filter ${skipReason}`, dataUrl: null, imageData: currentImage, enabled: false });
@@ -2120,6 +2188,53 @@ const SketchPreprocessingDashboard = () => {
       console.error('Error in enhanced pipeline:', error);
       throw error;
     }
+  };
+
+  const combineImagesWithIntensity = (image1, image2, blendMode, intensity) => {
+    const width = image1.width;
+    const height = image1.height;
+    const data1 = image1.data;
+    const data2 = image2.data;
+    const newData = new Uint8ClampedArray(data1.length);
+    
+    for (let i = 0; i < data1.length; i += 4) {
+      let result;
+      
+      switch (blendMode) {
+        case 'soft':
+          // Soft blend - weighted linear interpolation
+          const softBlend = data1[i] + (data2[i] * intensity);
+          result = Math.min(255, softBlend);
+          break;
+        case 'hard':
+          // Hard blend - binary decision based on intensity
+          result = data2[i] > (255 * (1 - intensity)) ? Math.max(data1[i], data2[i]) : data1[i];
+          break;
+        case 'overlay':
+          // Overlay blend - actual overlay math with intensity control
+          if (data2[i] > 0) { // Only blend where ridge filter detected something
+            const base = data1[i] / 255;
+            const overlay = data2[i] / 255;
+            const overlaid = base < 0.5 
+              ? 2 * base * overlay
+              : 1 - 2 * (1 - base) * (1 - overlay);
+            result = data1[i] * (1 - intensity) + (overlaid * 255) * intensity;
+          } else {
+            result = data1[i]; // Keep original where no ridge detected
+          }
+          break;
+        default:
+          result = Math.max(data1[i], data2[i] * intensity);
+      }
+      
+      result = Math.min(255, Math.max(0, result));
+      newData[i] = result;
+      newData[i + 1] = result;
+      newData[i + 2] = result;
+      newData[i + 3] = 255;
+    }
+    
+    return new ImageData(newData, width, height);
   };
 
   // Helper function to combine two images
@@ -3565,40 +3680,135 @@ const SketchPreprocessingDashboard = () => {
                       </div>
 
                       {/* Step 6: Ridge Filter */}
-                      <div className="border rounded-lg p-4 bg-gray-50">
-                        <h4 className="font-medium text-gray-800 mb-3 flex items-center gap-2">
-                          <span className="bg-blue-500 text-white text-xs px-2 py-1 rounded">6</span>
-                          Ridge Filter (Optional)
-                        </h4>
-                        <div className="space-y-3 text-sm">
-                          <div>
-                            <label className="flex items-center gap-2">
-                              <input
-                                type="checkbox"
-                                checked={enhancedPipelineParams.useRidgeFilter}
-                                onChange={(e) => updateEnhancedPipelineParam('useRidgeFilter', e.target.checked)}
-                                className="rounded"
-                              />
-                              <span className="text-gray-700">Enable Frangi Vesselness Filter</span>
-                            </label>
-                          </div>
-                          {enhancedPipelineParams.useRidgeFilter && (
+                      {enhancedPipelineSteps.step6_ridge && (
+                        <div className="border rounded-lg p-4 bg-gray-50">
+                          <h4 className="font-medium text-gray-800 mb-3 flex items-center gap-2">
+                            <span className="bg-blue-500 text-white text-xs px-2 py-1 rounded">6</span>
+                            Ridge Filter (Enhanced Controls)
+                          </h4>
+                          <div className="space-y-3 text-sm">
                             <div>
-                              <label className="block text-gray-600 mb-1">Ridge Threshold (0.01-0.1)</label>
-                              <input
-                                type="range"
-                                min="0.01"
-                                max="0.1"
-                                step="0.01"
-                                value={enhancedPipelineParams.ridgeThreshold}
-                                onChange={(e) => updateEnhancedPipelineParam('ridgeThreshold', e.target.value)}
-                                className="w-full"
-                              />
-                              <span className="text-xs text-gray-500">{enhancedPipelineParams.ridgeThreshold}</span>
+                              <label className="flex items-center gap-2">
+                                <input
+                                  type="checkbox"
+                                  checked={enhancedPipelineParams.useRidgeFilter}
+                                  onChange={(e) => updateEnhancedPipelineParam('useRidgeFilter', e.target.checked)}
+                                  className="rounded"
+                                />
+                                <span className="text-gray-700">Enable Ridge Filter</span>
+                              </label>
                             </div>
-                          )}
+                            {enhancedPipelineParams.useRidgeFilter && (
+                              <div className="space-y-3 pl-6 border-l-2 border-blue-200">
+                                <div>
+                                  <label className="block text-gray-600 mb-1">Detection Threshold</label>
+                                  <div className="flex gap-2 items-center">
+                                    <input
+                                      type="range"
+                                      min="0.001"
+                                      max="0.1"
+                                      step="0.001"
+                                      value={enhancedPipelineParams.ridgeThreshold}
+                                      onChange={(e) => updateEnhancedPipelineParam('ridgeThreshold', e.target.value)}
+                                      className="flex-1"
+                                    />
+                                    <input
+                                      type="number"
+                                      min="0.001"
+                                      max="0.1"
+                                      step="0.001"
+                                      value={enhancedPipelineParams.ridgeThreshold}
+                                      onChange={(e) => updateEnhancedPipelineParam('ridgeThreshold', e.target.value)}
+                                      className="w-20 border rounded px-2 py-1 text-xs"
+                                    />
+                                  </div>
+                                </div>
+                                
+                                <div>
+                                  <label className="block text-gray-600 mb-1">Filter Intensity</label>
+                                  <div className="flex gap-2 items-center">
+                                    <input
+                                      type="range"
+                                      min="0"
+                                      max="2"
+                                      step="0.01"
+                                      value={enhancedPipelineParams.ridgeIntensity}
+                                      onChange={(e) => updateEnhancedPipelineParam('ridgeIntensity', e.target.value)}
+                                      className="flex-1"
+                                    />
+                                    <input
+                                      type="number"
+                                      min="0"
+                                      max="2"
+                                      step="0.01"
+                                      value={enhancedPipelineParams.ridgeIntensity}
+                                      onChange={(e) => updateEnhancedPipelineParam('ridgeIntensity', e.target.value)}
+                                      className="w-20 border rounded px-2 py-1 text-xs"
+                                    />
+                                  </div>
+                                </div>
+                                
+                                <div>
+                                  <label className="block text-gray-600 mb-1">Blend Mode</label>
+                                  <select
+                                    value={enhancedPipelineParams.ridgeBlendMode}
+                                    onChange={(e) => updateEnhancedPipelineParam('ridgeBlendMode', e.target.value)}
+                                    className="w-full border rounded px-2 py-1"
+                                  >
+                                    <option value="soft">Soft (additive blend)</option>
+                                    <option value="hard">Hard (threshold blend)</option>
+                                    <option value="overlay">Overlay (conditional blend)</option>
+                                  </select>
+                                </div>
+                                
+                                <div className="grid grid-cols-2 gap-2">
+                                  <div>
+                                    <label className="block text-gray-600 mb-1">Pre-blur</label>
+                                    <div className="flex gap-1 items-center">
+                                      <input
+                                        type="range"
+                                        min="0"
+                                        max="5"
+                                        step="0.1"
+                                        value={enhancedPipelineParams.ridgePreBlur}
+                                        onChange={(e) => updateEnhancedPipelineParam('ridgePreBlur', e.target.value)}
+                                        className="flex-1"
+                                      />
+                                      <input
+                                        type="number"
+                                        min="0"
+                                        max="5"
+                                        step="0.1"
+                                        value={enhancedPipelineParams.ridgePreBlur}
+                                        onChange={(e) => updateEnhancedPipelineParam('ridgePreBlur', e.target.value)}
+                                        className="w-14 border rounded px-1 py-1 text-xs"
+                                      />
+                                    </div>
+                                  </div>
+                                  
+                                  <div>
+                                    <label className="flex items-center gap-2">
+                                      <input
+                                        type="checkbox"
+                                        checked={enhancedPipelineParams.ridgePostProcess}
+                                        onChange={(e) => updateEnhancedPipelineParam('ridgePostProcess', e.target.checked)}
+                                        className="rounded"
+                                      />
+                                      <span className="text-gray-700 text-xs">Post-smooth</span>
+                                    </label>
+                                  </div>
+                                </div>
+                                
+                                <div className="p-2 bg-blue-50 rounded text-xs">
+                                  <p className="text-blue-700">
+                                    <strong>Tip:</strong> Try intensity 0.1-0.5 with soft mode, or 0.5-1.0 with hard mode for visible effects.
+                                  </p>
+                                </div>
+                              </div>
+                            )}
+                          </div>
                         </div>
-                      </div>
+                      )}
 
                       {/* Steps 7-10: Compact Controls */}
                       <div className="border rounded-lg p-4 bg-gray-50">
